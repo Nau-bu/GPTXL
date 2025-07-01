@@ -1,0 +1,99 @@
+let
+  // 1 ▸ Folder resolution
+  ThisPath   = Text.From( Excel.CurrentWorkbook(){[Name="ThisWorkbookPath"]}[Content]{0}[Column1] ),
+  BaseFolder = if Text.EndsWith(ThisPath, "\") then ThisPath else ThisPath & "\",
+  RawFolder  = BaseFolder & "Raw\",
+
+  // 2 ▸ List only Excel files
+  AllFiles   = Folder.Files(RawFolder),
+  ExcelFiles = Table.SelectRows(AllFiles, each List.Contains({".xlsx",".xlsm",".xlsb"}, Text.Lower([Extension]))),
+
+  // 3 ▸ Load every sheet from every workbook
+  WithWB     = Table.AddColumn(ExcelFiles, "WB", each Excel.Workbook([Content], true)),
+  AllSheets  = Table.ExpandTableColumn(WithWB, "WB", {"Name","Data"}, {"SheetName","Data"}),
+
+  // 4 ▸ Promote headers in each sheet
+  Promoted   = Table.TransformColumns(
+                 AllSheets,
+                 { "Data", each Table.PromoteHeaders(_, [PromoteAllScalars=true]) }
+               ),
+
+  // ===== HISTORY: Combined Level History =====
+  HistSheets = Table.SelectRows(Promoted, each [SheetName] = "Combined Level History"),
+  FlatHist   = Table.Combine(HistSheets[Data]),
+  EnsureDate = let cols = Table.ColumnNames(FlatHist) in
+                  if List.Contains(cols, "Date") then FlatHist
+                  else Table.RenameColumns(FlatHist, {{cols{0}, "Date"}}),
+  Unpivoted  = Table.UnpivotOtherColumns(EnsureDate, {"Date"}, "Attribute", "Value"),
+  NonBlank   = Table.SelectRows(Unpivoted, each Text.Length(Text.From([Attribute]))>0),
+  Parsed     = Table.AddColumn(NonBlank, "P", each let p=Text.Split(Text.From([Attribute])," ") in 
+                                if List.Count(p)>1 then [BondID=Text.Combine(List.RemoveLastN(p,1)," "), Metric=List.Last(p)] else null),
+  Good       = Table.SelectRows(Parsed, each [P]<>null),
+  Expanded   = Table.ExpandRecordColumn(Good, "P", {"BondID","Metric"}),
+  FilteredM  = Table.SelectRows(Expanded, each List.Contains({"Price","YTM","G-Spread","T-Spread","YTC"}, [Metric])),
+  // pivot the metrics, taking the first value when duplicates exist
+  Pivoted    = Table.Pivot(FilteredM,
+                List.Distinct(FilteredM[Metric]),
+                "Metric",
+                "Value",
+                List.First),
+  RenamedH   = Table.RenameColumns(Pivoted,
+                { {"YTM","Yield to Maturity"}, {"YTC","Yield to Call"}, {"G-Spread","G Spread"}, {"T-Spread","T Spread"} },
+                MissingField.Ignore
+              ),
+  AddedAdjH  = Table.AddColumn(RenamedH, "Adjusted", each true, type logical),
+  AddDateH   = Table.RenameColumns(AddedAdjH, {{"Date","Trade Date and Time"}}, MissingField.Ignore),
+  HistFinal  = Table.SelectColumns(AddDateH,
+                {"Trade Date and Time","BondID","Price","Yield to Maturity","G Spread","T Spread","Yield to Call","Adjusted"},
+                MissingField.Ignore
+              ),
+
+  // ===== TRADES: sheets named “Trades …” =====
+  TradeSheets= Table.SelectRows(Promoted, each Text.StartsWith([SheetName],"Trades ") and Value.Is([Data], type table)),
+  Sample     = try TradeSheets{0}[Data] otherwise #table({},{}),
+  ExpandedT  = Table.ExpandTableColumn(TradeSheets, "Data", Table.ColumnNames(Sample)),
+  AddAdjT    = Table.AddColumn(ExpandedT, "Adjusted", each false, type logical),
+  AddID      = Table.AddColumn(AddAdjT, "BondID", each Text.Trim(Text.Middle(Text.From([SheetName]),7)), type text),
+  TypedT     = Table.TransformColumns(
+                AddID,
+                {
+                  {"Trade Date and Time", each try DateTime.From(_) otherwise null, type nullable datetime},
+                  {"Price",               each try Number.From(_)   otherwise null, type nullable number},
+                  {"Yield to Maturity",   each try Number.From(_)   otherwise null, type nullable number},
+                  {"G Spread",            each try Number.From(_)   otherwise null, type nullable number},
+                  {"T Spread",            each try Number.From(_)   otherwise null, type nullable number},
+                  {"Yield to Call",       each try Number.From(_)   otherwise null, type nullable number},
+                  {"Quantity",            each try Int64.From(_)    otherwise null, Int64.Type}
+                },
+                MissingField.Ignore
+              ),
+  WithBucket = Table.AddColumn(TypedT, "TradeSizeBucket", each 
+                let v=[Quantity] in
+                  if v<1000000 then "<1M"
+                  else if v<5000000 then "1M-5M"
+                  else ">5M",
+                type text
+              ),
+  TradesFinal= Table.SelectColumns(WithBucket,
+                {"Trade Date and Time","BondID","Price","Yield to Maturity","G Spread","T Spread","Yield to Call","Quantity","TradeSizeBucket","Adjusted"},
+                MissingField.Ignore
+              ),
+
+  // ===== STACK HISTORY + TRADES =====
+  Combined   = Table.Combine({HistFinal, TradesFinal}),
+
+  // ===== DERIVE YEAR & MATURITY BUCKET =====
+  WithYear   = Table.AddColumn(Combined, "YearMaturity", each try 
+                  Number.From(Text.AfterDelimiter(List.Last(Text.Split(Text.From([BondID])," ")),"/"))
+                otherwise null, Int64.Type),
+  WithTenor  = Table.AddColumn(WithYear, "MaturityBucket", each
+                  if [YearMaturity] <= Date.Year(Date.AddYears(DateTime.LocalNow(),3)) then "3Y"
+                  else if [YearMaturity] <= Date.Year(Date.AddYears(DateTime.LocalNow(),5)) then "5Y"
+                  else if [YearMaturity] <= Date.Year(Date.AddYears(DateTime.LocalNow(),10)) then "10Y"
+                  else ">10Y",
+                type text),
+
+  //  final shape
+  PQ_MasterData = WithTenor
+in
+  PQ_MasterData
