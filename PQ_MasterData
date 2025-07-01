@@ -64,14 +64,19 @@ let
                   {"T Spread",            each try Number.From(_)   otherwise null, type nullable number},
                   {"Yield to Call",       each try Number.From(_)   otherwise null, type nullable number},
                   {"Quantity",            each try Int64.From(_)    otherwise null, Int64.Type}
-                },
-                MissingField.Ignore
-              ),
-  WithBucket = Table.AddColumn(TypedT, "TradeSizeBucket", each 
-                let v=[Quantity] in
-                  if v<1000000 then "<1M"
-                  else if v<5000000 then "1M-5M"
-                  else ">5M",
+                   },
+               null,
+               MissingField.Ignore
+             ),
+  WithBucket = Table.AddColumn(
+                TypedT,
+                "TradeSizeBucket",
+                each
+                  let q = try [Quantity] otherwise null in
+                    if q=null then null
+                    else if q<1000000 then "<1M"
+                    else if q<5000000 then "1M-5M"
+                    else ">5M",
                 type text
               ),
   TradesFinal= Table.SelectColumns(WithBucket,
@@ -94,6 +99,8 @@ let
                 type text),
 
   //  final shape
-  PQ_MasterData = WithTenor
+  PQ_MasterData = WithTenor,
+    // final shape
+    TradeSizeBucket = PQ_MasterData{63}[TradeSizeBucket]
 in
-  PQ_MasterData
+  TradeSizeBucket
